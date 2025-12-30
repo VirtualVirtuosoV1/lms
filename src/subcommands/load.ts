@@ -20,8 +20,8 @@ import { addCreateClientOptions, createClient, type CreateClientArgs } from "../
 import { formatElapsedTime } from "../formatElapsedTime.js";
 import { formatSizeBytes1000 } from "../formatSizeBytes1000.js";
 import { addLogLevelOptions, createLogger, type LogLevelArgs } from "../logLevel.js";
-import { Spinner } from "../Spinner.js";
 import { runPromptWithExitHandling } from "../prompt.js";
+import { Spinner } from "../Spinner.js";
 import { createRefinedNumberParser } from "../types/refinedNumber.js";
 
 const gpuOptionParser = (str: string): number => {
@@ -349,6 +349,14 @@ async function loadModel(
   logger.debug("Identifier:", identifier);
   logger.debug("Config:", config);
 
+  const gpuRatio = config.gpu?.ratio;
+  const gpuExplicitlyOff = gpuRatio === 0;
+  if (!gpuExplicitlyOff) {
+    await assertSelectedRuntimeCompatibleForGpu(logger, client);
+  } else {
+    logger.debug("GPU offload disabled; skipping runtime compatibility guard.");
+  }
+
   const spinner = new Spinner(`Loading ${path}`);
   const startTime = Date.now();
   const abortController = new AbortController();
@@ -359,7 +367,7 @@ async function loadModel(
     logger.warn("Load cancelled.");
     process.exit(1);
   };
-
+  
   process.addListener("SIGINT", sigintListener);
   const llmModel = await (model.type === "llm" ? client.llm : client.embedding).load(path, {
     verbose: false,
@@ -379,6 +387,49 @@ async function loadModel(
   logger.info(text`
     To use the model in the API/SDK, use the identifier "${chalk.green(info!.identifier)}".
   `);
+}
+
+async function assertSelectedRuntimeCompatibleForGpu(logger: SimpleLogger, client: LMStudioClient) {
+  const surveyResult = await client.runtime.surveyHardware({ type: "selected" });
+
+  // Prefer llama.cpp, otherwise fall back to first engine
+  const engineSurvey =
+    surveyResult.engines.find(engine => engine.engine === "llama.cpp") ?? surveyResult.engines[0];
+
+  if (engineSurvey === undefined) {
+    // No survey results -> don't block
+    logger.debug("No runtime survey results; skipping compatibility guard.");
+    return;
+  }
+
+  if (engineSurvey.compatibility.status === "Compatible") {
+    return;
+  }
+
+  // Try to extract gfx#### from GPU names (common on ROCm)
+  const gpus = engineSurvey.hardwareSurvey.gpuSurveyResult?.gpuInfo ?? [];
+  const gfx =
+    gpus
+      .map(g => g.name.match(/\bgfx\d+\b/i)?.[0])
+      .find((x): x is string => x !== undefined) ?? undefined;
+
+  const title = gfx ? `Unsupported GPU architecture (${gfx})` : "Incompatible runtime/hardware";
+  const details = engineSurvey.compatibility.message
+    ? `${engineSurvey.compatibility.status} — ${engineSurvey.compatibility.message}`
+    : `Status: ${engineSurvey.compatibility.status}`;
+
+
+  logger.errorWithoutPrefix(
+    makeTitledPrettyError(title, text`
+          ${details}
+
+          Selected runtime: ${engineSurvey.name} (${engineSurvey.version})
+          Engine: ${engineSurvey.engine}
+
+          Tip: run ${chalk.yellow("lms survey")} to see detailed compatibility info.
+     `).message,
+    );
+  process.exit(1);
 }
 
 function printEstimatedResourceUsage(
